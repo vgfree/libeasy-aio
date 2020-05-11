@@ -12,9 +12,15 @@
 #include <sys/stat.h>
 #include <sys/param.h>	/*for roundup*/
 #include <poll.h>
+#include <sys/ioctl.h>
+#include <linux/fs.h>
 
 #include "array.h"
 #include "eaio_api.h"
+
+#ifndef MIN
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+#endif
 
 #if GCC_VERSION
   #define likely(x)     __builtin_expect(!!(x), 1)
@@ -158,6 +164,11 @@ err:
 bool opt_async = false;
 bool opt_random = false;
 uint64_t opt_bs = (4 << 10);
+uint64_t opt_ibs = (4 << 10);
+uint64_t opt_obs = (4 << 10);
+int opt_count = 0;
+int opt_skip = 0;
+int opt_seek = 0;
 bool opt_direct = false;
 int opt_thread = 1;
 char *opt_if = NULL;
@@ -165,26 +176,36 @@ char *opt_of = NULL;
 
 static struct option longopts[] = {
 	{ "help", no_argument,       NULL, 'h' },
-	{ "async", required_argument, NULL, 'a' },
+	{ "async", no_argument, NULL, 'a' },
 	{ "bs", required_argument, NULL, 'b' },
-	{ "direct", required_argument, NULL, 'd' },
+	{ "direct", no_argument, NULL, 'd' },
 	{ "if", required_argument, NULL, 'i' },
 	{ "of", required_argument, NULL, 'o' },
-	{ "random", required_argument, NULL, 'r' },
+	{ "random", no_argument, NULL, 'r' },
 	{ "thread", required_argument, NULL, 't' },
+	{ "count", required_argument, NULL, 'c' },
+	{ "ibs", required_argument, NULL, 'I' },
+	{ "obs", required_argument, NULL, 'O' },
+	{ "skip", required_argument, NULL, 'p' },
+	{ "seek", required_argument, NULL, 'k' },
 	{ NULL,   0,                 NULL, 0   }
 };
 
 static void usage(const char *execfile)
 {
 	printf("Usage: %s [OPTION...]\n\n", execfile);
-	printf("  -a, --async=[0/1]           1 is enable async\n");
-	printf("  -b, --bs=size               set bs size\n");
-	printf("  -d, --direct=[0/1]          1 is enable direct\n");
+	printf("  -a, --async                 enable async, default is sync\n");
+	printf("  -b, --bs=size               set bs size, default is 4k\n");
+	printf("  -d, --direct                enable direct, default is indirect\n");
 	printf("  -i, --if=file               set the input file\n");
 	printf("  -o, --of=file               set the output file\n");
-	printf("  -r, --random=[0/1]          1 is enable random\n");
+	printf("  -r, --random                enable random, default is order\n");
 	printf("  -t, --thread=num            set thread io count\n");
+	printf("  -c, --count=num             set bs op count, default is file size\n");
+	printf("  -I, --ibs=size              set ibs size, default is 4k\n");
+	printf("  -O, --obs=size              set obs size, default is 4k\n");
+	printf("  -p, --skip=num              set ibs op count, default is 0\n");
+	printf("  -k, --seek=num              set obs op count, default is 0\n");
 	printf("  -h, --help                  show this message\n\n");
 }
 
@@ -192,10 +213,10 @@ int parse(int argc, char *argv[])
 {
 	int             c;
 
-	while ((c = getopt_long(argc, argv, "a:b:d:i:o:r:t:h", longopts, NULL)) != EOF) {
+	while ((c = getopt_long(argc, argv, "ab:di:o:r:t:c:I:O:p:k:h", longopts, NULL)) != EOF) {
 		switch (c) {
 			case 'a':
-				opt_async = atoi(optarg);
+				opt_async = true;
 				break;
 
 			case 'b':
@@ -203,7 +224,7 @@ int parse(int argc, char *argv[])
 				break;
 
 			case 'd':
-				opt_direct = atoi(optarg);
+				opt_direct = true;
 				break;
 
 			case 'i':
@@ -215,11 +236,31 @@ int parse(int argc, char *argv[])
 				break;
 
 			case 'r':
-				opt_random = atoi(optarg);
+				opt_random = true;
 				break;
 
 			case 't':
 				opt_thread = atoi(optarg);
+				break;
+
+			case 'c':
+				opt_count = atoi(optarg);
+				break;
+
+			case 'I':
+				option_parse_size(optarg, &opt_ibs);
+				break;
+
+			case 'O':
+				option_parse_size(optarg, &opt_obs);
+				break;
+
+			case 'p':
+				opt_skip = atoi(optarg);
+				break;
+
+			case 'k':
+				opt_seek = atoi(optarg);
 				break;
 
 			default:
@@ -295,6 +336,8 @@ static inline bool is_aligned_to_pagesize(void *p)
 int do_test_rw(void *data, off_t offset, size_t length)
 {
 	struct eaio_context *ctx = g_ctx;
+	uint64_t if_skip_offset = opt_ibs * opt_skip;
+	uint64_t of_seek_offset = opt_obs * opt_seek;
 
 	/*direct适合libaio*/
 #define SECTOR_SIZE (1U << 9)
@@ -311,7 +354,7 @@ int do_test_rw(void *data, off_t offset, size_t length)
 		fprintf(stderr, "test: Unable to open file \"%s\": %s.\n", opt_if, strerror(errno));
 		return -1;
 	}
-	int ret = _do_rw(ctx, EAIO_OPT_PREAD, 0, 0, rfd, data, length, offset);
+	int ret = _do_rw(ctx, EAIO_OPT_PREAD, 0, 0, rfd, data, length, if_skip_offset + offset);
 	assert(ret == length);
 	close(rfd);
 
@@ -320,7 +363,7 @@ int do_test_rw(void *data, off_t offset, size_t length)
 		fprintf(stderr, "test: Unable to open file \"%s\": %s.\n", opt_of, strerror(errno));
 		return -1;
 	}
-	ret = _do_rw(ctx, EAIO_OPT_PWRITE, 1, 0, wfd, data, length, offset);
+	ret = _do_rw(ctx, EAIO_OPT_PWRITE, 1, 0, wfd, data, length, of_seek_offset + offset);
 	assert(ret == length);
 	close(wfd);
 	return 0;
@@ -387,20 +430,45 @@ int go_test(struct eaio_context *aio_ctx)
 {
 	g_ctx = aio_ctx;
 
+	struct stat stat_buf;
+	if (lstat(opt_if, &stat_buf) < 0) {
+		fprintf(stderr, "test: Unable to get file \"%s\" type: %s.\n", opt_if, strerror(errno));
+		return(-errno);
+	}
+	if (!S_ISREG(stat_buf.st_mode) && !S_ISBLK(stat_buf.st_mode)) {
+		fprintf(stderr, "test: Not support: \"%s\".\n", opt_if);
+		return -1;
+	}
+
 	int rfd = open(opt_if, O_RDONLY);
 	if (rfd < 0) {
 		fprintf(stderr, "test: Unable to open file \"%s\": %s.\n", opt_if, strerror(errno));
 		return(-errno);
 	}
-	struct stat stat_buf;
-	int rc = fstat(rfd, &stat_buf);
-	if (rc != 0) {
-		fprintf(stderr, "test: Unable to guess size of file \"%s\": %s.\n", opt_if, strerror(errno));
-		return(-errno);
-	}
+	if (S_ISREG(stat_buf.st_mode)) {
+		int rc = fstat(rfd, &stat_buf);
+		if (rc != 0) {
+			fprintf(stderr, "test: Unable to guess size of file \"%s\": %s.\n", opt_if, strerror(errno));
+			return(-errno);
+		}
 
-	g_data_size = stat_buf.st_size;
+		g_data_size = stat_buf.st_size;
+	} else {
+		int rc = ioctl(rfd, BLKGETSIZE64, &g_data_size);
+		if (rc < 0) {
+			fprintf(stderr, "test: Unable to guess size of block \"%s\": %s.\n", opt_if, strerror(errno));
+			return(-errno);
+		}
+	}
 	close(rfd);
+	if ((opt_ibs * opt_skip) >= g_data_size) {
+		fprintf(stderr, "test: Unable to skip %ld size of \"%s\".\n", opt_ibs * opt_skip, opt_if);
+		return -1;
+	}
+	g_data_size -= opt_ibs * opt_skip;
+	if (opt_count) {
+		g_data_size = MIN(opt_count * opt_bs, g_data_size);
+	}
 
 
 	int wfd = open(opt_of, O_WRONLY | O_TRUNC | O_CREAT, 0644);
