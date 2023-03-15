@@ -83,7 +83,7 @@ static bool eaio_queue_have_waiting(struct eaio_queue *qaio)
 static long eaio_queue_getevents(struct eaio_queue *qaio, long need)
 {
 	struct io_event events[need];
-	memset(events, 0, sizeof(struct io_event) * need);
+	//memset(events, 0, sizeof(struct io_event) * need);
 
 	struct timespec ts = {
 		.tv_sec = 0,
@@ -105,7 +105,7 @@ static long eaio_queue_getevents(struct eaio_queue *qaio, long need)
 
 static int eaio_queue_try_inflight_and_submit(struct eaio_queue *qaio)
 {
-	struct iocb *iocbp[EAIO_INFLIGHT_MAX] = {0};
+	struct iocb *iocbp[EAIO_INFLIGHT_MAX];
 
 	int done = 0;
 	int todo = EAIO_INFLIGHT_MAX - qaio->inflight;
@@ -190,7 +190,7 @@ static int efd_cmp(const void *efd1, const void *efd2)
 
 int eaio_context_exec(struct eaio_context *aio_ctx)
 {
-	int *efds = calloc(aio_ctx->qcnts * 2, sizeof(int));
+	int efds[aio_ctx->qcnts * 2];
 	for (int i = 0; i < aio_ctx->qcnts; i++) {
 		struct eaio_queue *qaio = &aio_ctx->qslot[i];
 		efds[i*2 + 0] = qaio->i_efd;
@@ -228,7 +228,6 @@ int eaio_context_exec(struct eaio_context *aio_ctx)
 			} while ((qaio->inflight != EAIO_INFLIGHT_MAX) && eaio_queue_have_waiting(qaio));
 		}
 	}
-	free(efds);
 	return 0;
 }
 
